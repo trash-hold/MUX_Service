@@ -161,6 +161,12 @@ ErrorCodes setOutput(const word& dataA, const word& dataB, const byte& addr)
 
 void scan()
 {
+  /*
+  * Checks if devices with adresses from 1 to 126 are on the bus
+  * Transmits the list of addresses in batches of MAX_I2C_DEVICES
+  * The transmission looks as follows:
+  * <Number of addresess> <0x00 if not last transmission, 0XFF if last> <list of adresses>
+  */
   byte error, address;
 
   uint8_t nDevices;
@@ -178,13 +184,16 @@ void scan()
       {
           // Inform the receiver how many addresses will be transfered 
           Serial.print(MAX_I2C_DEVICES);
+          Serial.print(' ');
           // Inform that this is not the end of the tranmission
           Serial.print(0x00);
+          Serial.print(' ');
 
           // Send all the addresses that were acquired
           for(uint8_t i = 0; i < MAX_I2C_DEVICES; i++)
           {
             Serial.print(addresses[i]);
+            Serial.print(' ');
             // Zero them so they won't be sent twice
             addresses[i] = 0x00;
           }
@@ -203,13 +212,16 @@ void scan()
 
   // Inform the receiver how many addresses will be transfered 
   Serial.print(nDevices);
+  Serial.print(' ');
   // Inform that this is the end of the tranmission
   Serial.print(0xFF);
+  Serial.print(' ');
 
   // Send all the addresses that were acquired
   for(uint8_t i = 0; i < nDevices; i++)
   {
     Serial.print(addresses[i]);
+    Serial.print(' ');
   } 
   
 }
