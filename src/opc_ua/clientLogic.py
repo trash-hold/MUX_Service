@@ -6,6 +6,7 @@ class OpcUaClientLogic:
     def __init__(self, config: dict):
         self.client = Client(url=config['endpoint'], timeout=30) 
         self.namespace_uri = config['namespace_uri']
+        self.endpoint_url = config['endpoint']
         node_map = config['nodes']
         self.gateway_name = node_map['gateway_object']
         self.mux_prefix = node_map['mux_prefix']
@@ -16,33 +17,53 @@ class OpcUaClientLogic:
         # Get the new method name from config
         self.set_channel_method_name = node_map['methods']['set_channel']
         
+        self.client: Client | None = None
         self.gateway_node = None
         self.rescan_method_node = None
         self.namespace_idx = 0
-        # Cache now includes the set_channel method node
         self.device_nodes = {}
 
-    async def connect(self):
-        # This method is correct and unchanged
-        logging.info(f"Attempting to connect to {self.client.server_url}...")
+    async def connect(self, new_url: str):
+        """
+        Creates a new client instance and attempts to connect.
+        This is safe to call multiple times.
+        """
+        # *** KEY CHANGE: A new Client object is created for every attempt ***
+        # This prevents state corruption from a previous failed attempt.
+        self.client = Client(url=new_url, timeout=10) # Using a slightly shorter timeout
+        
+        logging.info(f"Attempting to connect to {new_url}...")
         try:
             await self.client.connect()
+            logging.info("STEP 1/3: Physical connection successful.")
+            
             self.namespace_idx = await self.client.get_namespace_index(self.namespace_uri)
-            logging.info(f"Successfully connected. Namespace '{self.namespace_uri}' is at index {self.namespace_idx}.")
+            logging.info(f"STEP 2/3: Namespace '{self.namespace_uri}' found at index {self.namespace_idx}.")
+            
+            logging.info("STEP 3/3: Base connection process complete.")
             return True
         except Exception as e:
-            logging.error(f"Failed to connect or find namespace: {e}")
-            try:
-                server_namespaces = await self.client.get_namespace_array()
-                logging.info("Available namespaces: %s", server_namespaces)
-            except Exception:
-                pass
-            await self.client.disconnect()
+            logging.error(f"CONNECTION FAILED: An error occurred: {e}", exc_info=False)
+            # No need to call disconnect. The client object was never fully connected
+            # and will be replaced on the next attempt anyway.
+            self.client = None # Explicitly set to None on failure
             return False
 
     async def disconnect(self):
-        if self.client:
-            await self.client.disconnect()
+        # Only try to disconnect if the client exists and is connected.
+        if self.client and self.client.uaclient:
+            try:
+                await self.client.disconnect()
+                logging.info("Disconnected from server.")
+            except Exception as e:
+                logging.warning(f"Error during disconnect, but proceeding: {e}")
+        
+        # Reset all state
+        self.client = None
+        self.gateway_node = None
+        self.rescan_method_node = None
+        self.device_nodes.clear()
+        self.namespace_idx = 0
 
     async def find_gateway_and_methods(self):
         # This method is correct and unchanged

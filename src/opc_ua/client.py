@@ -82,7 +82,7 @@ class ClientCLI:
             return
             
         try:
-            channel = int(input(f"Enter channel number (0-255) for MUX {addr}: "))
+            channel = int(input(f"Enter channel number (1-8) for MUX {addr}: "))
             if not (0 <= channel <= 255):
                 raise ValueError("Channel out of range")
         except ValueError as e:
