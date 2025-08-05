@@ -165,46 +165,22 @@ class SerialCommunicator:
             list[int] | None: A list of found I2C addresses, or None on error.
         """
         command = "SCN"
-        logging.info(f"Sending: '{command}'")
-        if not self.ser or not self.ser.is_open:
-            logging.error("Cannot send command. Serial port is not open.")
+        response = self._send_command(command, timeout=10.0)
+
+        if response is None:
             return None
         
-        # Clear the queue before starting
-        while not self.response_queue.empty():
-            self.response_queue.get_nowait()
-
-        self.ser.write(f"{command}\n".encode('utf-8'))
-        
-        found_devices = []
-        is_last_transmission = False
-        
-        while not is_last_transmission:
-            try:
-                response = self.response_queue.get(timeout=5.0) # Scan can take time
-                parts = response.split()
-                
-                if len(parts) < 2:
-                    logging.error(f"Invalid scan response format: '{response}'")
-                    continue
-                
-                num_devices = int(parts[0])
-                end_flag = int(parts[1])
-                addresses = [int(p) for p in parts[2:2+num_devices]]
-                
-                found_devices.extend(addresses)
-                
-                if end_flag == 0xFF:
-                    is_last_transmission = True
-
-            except queue.Empty:
-                logging.error("Scan timed out waiting for a response from Arduino.")
-                return None
-            except (ValueError, IndexError) as e:
-                logging.error(f"Failed to parse scan response: '{response}'. Error: {e}")
-                return None
-        
-        return found_devices
+        # The expected response is a single line of space-separated numbers (e.g., "32 33 34")
+        try:
+            # Return an empty list if the response string is empty or just whitespace
+            if not response.strip():
+                return []
+            # Split the string by spaces and convert each part to an integer
+            addresses = [int(addr) for addr in response.split()]
+            return addresses
+        except ValueError:
+            logging.error(f"Failed to parse scan response: '{response}' contains non-numeric values.")
+            return None
 
     def test_connection(self) -> str | None:
         """Sends the TEST command to check the connection."""

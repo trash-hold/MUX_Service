@@ -1,0 +1,7 @@
+{
+  "communication_type": "serial",
+  "settings": {
+    "port": "<INSERT>",
+    "baudrate": 115200
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "endpoint": "opc.tcp://<IP>:<PORT>/<NAME>/",
+  "name": "Arduino OPC UA Gateway",
+  "namespace_uri": "http://solutions.example.com/arduinogateway"
+}
