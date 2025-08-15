@@ -4,77 +4,77 @@ from asyncua import Client, ua, Node
 
 class OpcUaClientLogic:
     def __init__(self, config: dict):
-        self.client = Client(url=config['endpoint'], timeout=30) 
+        self.client = Client(url=config['endpoint'], timeout=10)
         self.namespace_uri = config['namespace_uri']
-        self.endpoint_url = config['endpoint']
+        
+        # --- REWORK: Map new variable names from config ---
         node_map = config['nodes']
         self.gateway_name = node_map['gateway_object']
         self.mux_prefix = node_map['mux_prefix']
-        self.channel_var_name = node_map['variables']['channel']
-        self.status_var_name = node_map['variables']['status']
-        self.rescan_method_name = node_map['methods']['rescan']
-        self.reset_method_name = node_map['methods']['reset']
-        # Get the new method name from config
-        self.set_channel_method_name = node_map['methods']['set_channel']
         
-        self.client: Client | None = None
-        self.gateway_node = None
-        self.rescan_method_node = None
+        # Variable names
+        var_names = node_map['variables']
+        self.channel_var_name = var_names['channel']
+        self.status_var_name = var_names['status']
+        self.set_channel_var_name = var_names['set_channel'] # Was a method
+        self.reset_var_name = var_names['reset']             # Was a method
+        self.mux_count_var_name = var_names['mux_count']     # New variable
+        
+        # Method names
+        self.rescan_method_name = node_map['methods']['rescan']
+        
+        # Internal state
+        self.gateway_node: Node | None = None
+        self.rescan_method_node: Node | None = None
+        self.mux_count_node: Node | None = None # New node cache
         self.namespace_idx = 0
-        self.device_nodes = {}
+        self.device_nodes = {} # Cache for MUX device nodes
 
     async def connect(self, new_url: str):
-        """
-        Creates a new client instance and attempts to connect.
-        This is safe to call multiple times.
-        """
-        # *** KEY CHANGE: A new Client object is created for every attempt ***
-        # This prevents state corruption from a previous failed attempt.
-        self.client = Client(url=new_url, timeout=10) # Using a slightly shorter timeout
-        
+        """Creates a new client instance and attempts to connect."""
+        self.client = Client(url=new_url, timeout=10)
         logging.info(f"Attempting to connect to {new_url}...")
         try:
             await self.client.connect()
             logging.info("STEP 1/3: Physical connection successful.")
-            
             self.namespace_idx = await self.client.get_namespace_index(self.namespace_uri)
             logging.info(f"STEP 2/3: Namespace '{self.namespace_uri}' found at index {self.namespace_idx}.")
-            
             logging.info("STEP 3/3: Base connection process complete.")
             return True
         except Exception as e:
             logging.error(f"CONNECTION FAILED: An error occurred: {e}", exc_info=False)
-            # No need to call disconnect. The client object was never fully connected
-            # and will be replaced on the next attempt anyway.
-            self.client = None # Explicitly set to None on failure
+            self.client = None
             return False
 
     async def disconnect(self):
-        # Only try to disconnect if the client exists and is connected.
         if self.client and self.client.uaclient:
             try:
                 await self.client.disconnect()
                 logging.info("Disconnected from server.")
             except Exception as e:
                 logging.warning(f"Error during disconnect, but proceeding: {e}")
-        
-        # Reset all state
         self.client = None
         self.gateway_node = None
         self.rescan_method_node = None
+        self.mux_count_node = None
         self.device_nodes.clear()
         self.namespace_idx = 0
 
     async def find_gateway_and_methods(self):
-        # This method is correct and unchanged
+        """Finds the main gateway object and its children (methods and variables)."""
         try:
             objects_node = self.client.get_objects_node()
             self.gateway_node = await objects_node.get_child(f"{self.namespace_idx}:{self.gateway_name}")
+            
+            # --- REWORK: Find the rescan method AND the new mux count variable ---
             self.rescan_method_node = await self.gateway_node.get_child(f"{self.namespace_idx}:{self.rescan_method_name}")
+            self.mux_count_node = await self.gateway_node.get_child(f"{self.namespace_idx}:{self.mux_count_var_name}")
+            logging.info("Successfully found Gateway object and its key members.")
         except Exception as e:
-            logging.error(f"Error finding gateway node or methods: {e}")
+            logging.error(f"Error finding gateway node or its members: {e}")
 
     async def discover_devices(self) -> list[str]:
+        """Discovers MUX objects under the gateway and caches their variable nodes."""
         if not self.gateway_node:
             return []
         self.device_nodes.clear()
@@ -85,13 +85,14 @@ class OpcUaClientLogic:
                 if browse_name.Name.startswith(self.mux_prefix):
                     addr_str = browse_name.Name.split('_')[1]
                     discovered_addrs.append(addr_str)
-                    # --- Find and cache the new SetChannel method ---
+                    
+                    # --- REWORK: Cache the variable nodes, not methods ---
                     self.device_nodes[addr_str] = {
                         'obj': child_node,
-                        'channel': await child_node.get_child(f"{self.namespace_idx}:{self.channel_var_name}"),
-                        'status': await child_node.get_child(f"{self.namespace_idx}:{self.status_var_name}"),
-                        'reset': await child_node.get_child(f"{self.namespace_idx}:{self.reset_method_name}"),
-                        'set_channel': await child_node.get_child(f"{self.namespace_idx}:{self.set_channel_method_name}")
+                        'channel_val': await child_node.get_child(f"{self.namespace_idx}:{self.channel_var_name}"),
+                        'status_val': await child_node.get_child(f"{self.namespace_idx}:{self.status_var_name}"),
+                        'set_channel_var': await child_node.get_child(f"{self.namespace_idx}:{self.set_channel_var_name}"),
+                        'reset_var': await child_node.get_child(f"{self.namespace_idx}:{self.reset_var_name}"),
                     }
             return sorted(discovered_addrs)
         except Exception as e:
@@ -99,47 +100,56 @@ class OpcUaClientLogic:
             return []
 
     async def read_device_state(self, addr_str: str) -> tuple | None:
-        # This method is correct and unchanged
         if addr_str not in self.device_nodes: return None
         try:
             nodes = self.device_nodes[addr_str]
-            channel_val = await nodes['channel'].read_value()
-            status_val = await nodes['status'].read_value()
+            channel_val = await nodes['channel_val'].read_value()
+            status_val = await nodes['status_val'].read_value()
             return channel_val, status_val
         except Exception as e:
             logging.error(f"Could not read state for device {addr_str}: {e}")
             return None
 
-    # --- REWRITTEN: This now calls the method instead of writing to a variable ---
+    # --- NEW METHOD ---
+    async def read_mux_count(self) -> int | None:
+        """Reads the value of the MuxBoardCount variable."""
+        if not self.mux_count_node: return None
+        try:
+            count = await self.mux_count_node.read_value()
+            return count
+        except Exception as e:
+            logging.error(f"Could not read Mux board count: {e}")
+            return None
+
+    # --- REWORKED: This now writes to a variable ---
     async def write_channel(self, addr_str: str, channel: int) -> bool:
-        """Calls the SetChannel method on the specified MUX object."""
+        """Writes a new value to the SetChannel variable on the specified MUX object."""
         if addr_str not in self.device_nodes:
             return False
         try:
-            mux_obj = self.device_nodes[addr_str]['obj']
-            set_ch_method = self.device_nodes[addr_str]['set_channel']
-            
-            # Call the method with the channel as an argument
-            result = await mux_obj.call_method(set_ch_method, ua.Variant(channel, ua.VariantType.Byte))
-            logging.info(f"SetChannel for {addr_str} returned: {result}")
+            set_ch_var_node = self.device_nodes[addr_str]['set_channel_var']
+            await set_ch_var_node.write_value(ua.Variant(channel, ua.VariantType.Byte))
+            logging.info(f"Successfully wrote {channel} to SetChannel for MUX {addr_str}")
             return True
         except Exception as e:
-            logging.error(f"Could not call SetChannel for device {addr_str}: {e}")
+            logging.error(f"Could not write to SetChannel for device {addr_str}: {e}")
             return False
 
-    # The other methods are correct and unchanged
-    async def call_reset_mux(self, addr_str: str) -> str | None:
-        if addr_str not in self.device_nodes: return None
+    # --- REWORKED: Renamed and now writes to a variable ---
+    async def trigger_reset_mux(self, addr_str: str) -> bool:
+        """Writes 'True' to the Reset variable to trigger a reset on the MUX."""
+        if addr_str not in self.device_nodes: return False
         try:
-            mux_obj = self.device_nodes[addr_str]['obj']
-            reset_method = self.device_nodes[addr_str]['reset']
-            result = await mux_obj.call_method(reset_method)
-            return result
+            reset_var_node = self.device_nodes[addr_str]['reset_var']
+            await reset_var_node.write_value(True)
+            logging.info(f"Successfully wrote True to Reset for MUX {addr_str}")
+            return True
         except Exception as e:
-            logging.error(f"Could not call Reset on device {addr_str}: {e}")
-            return "CALL_FAILED"
+            logging.error(f"Could not write to Reset for device {addr_str}: {e}")
+            return False
 
     async def call_rescan_hardware(self):
+        # This method remains unchanged as rescan is still a method.
         if not self.gateway_node or not self.rescan_method_node: return False
         try:
             await self.gateway_node.call_method(self.rescan_method_node)
