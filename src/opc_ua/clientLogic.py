@@ -6,8 +6,7 @@ class OpcUaClientLogic:
     def __init__(self, config: dict):
         self.client = Client(url=config['endpoint'], timeout=10)
         self.namespace_uri = config['namespace_uri']
-        
-        # --- REWORK: Map new variable names from config ---
+        self.endpoint_url = config['endpoint']
         node_map = config['nodes']
         self.gateway_name = node_map['gateway_object']
         self.mux_prefix = node_map['mux_prefix']
@@ -128,7 +127,7 @@ class OpcUaClientLogic:
             return False
         try:
             set_ch_var_node = self.device_nodes[addr_str]['set_channel_var']
-            await set_ch_var_node.write_value(ua.Variant(channel, ua.VariantType.Byte))
+            await set_ch_var_node.write_value(ua.Variant(channel, ua.VariantType.Int32))
             logging.info(f"Successfully wrote {channel} to SetChannel for MUX {addr_str}")
             return True
         except Exception as e:

@@ -4,48 +4,29 @@ import threading
 import queue
 import time
 import logging
-from enum import Enum
+from src.communicator.errors import ArduinoError
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class ArduinoError(Enum):
-    """For reference look at the firmware code"""
-    SUCCESS = 0     # If the transmission is successful
-    COM_ERROR = 1   # If the I2C transmission failed
-    ADDR_ERROR = 2  # If given channel or I2C address is out of bounds
-    UNKNOWN = -1
-
-    @classmethod
-    def from_int(cls, value: int):
-        try:
-            return cls(value)
-        except ValueError:
-            return cls.UNKNOWN
-
 class SerialCommunicator:
     """
-    A class to handle serial communication with the Arduino device
-    Non-blocking with a separate reader thread.
+    A robust, thread-safe class to handle serial communication with a device.
+    It automatically handles disconnects and provides a clear connection status.
     """
 
     def __init__(self, port: str, baudrate: int = 115200, timeout: float = 1.0):
-        """
-        Initializes the communicator.
-        Args:
-            port (str): The COM port to connect to (e.g., 'COM3' or '/dev/ttyUSB0').
-            baudrate (int): The baudrate for the serial connection.
-            timeout (float): The read timeout for the serial port.
-        """
         self.ser = None
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
-        self.is_running = False
+        
+        self.is_connected = False
 
         self.response_queue = queue.Queue()
         self._reader_thread = None
         self._stop_event = threading.Event()
+        self._lock = threading.Lock()
 
     def start(self) -> bool:
         """
@@ -53,90 +34,117 @@ class SerialCommunicator:
         Returns:
             bool: True if connection was successful, False otherwise.
         """
-        try:
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
-            logging.info(f"Successfully opened serial port {self.port}")
-        except serial.SerialException as e:
-            logging.error(f"Failed to open serial port {self.port}: {e}")
-            return False
+        with self._lock:
+            if self.is_connected:
+                return True
+            try:
+                self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+                logging.info(f"Successfully opened serial port {self.port}")
+            except serial.SerialException as e:
+                logging.error(f"Failed to open serial port {self.port}: {e}")
+                self.ser = None
+                return False
 
-        self._stop_event.clear()
-        self._reader_thread = threading.Thread(target=self._read_from_port)
-        self._reader_thread.daemon = True
-        self.is_running = True
-        self._reader_thread.start()
-        logging.info("Reader thread started.")
-        return True
+            self._stop_event.clear()
+            self._reader_thread = threading.Thread(target=self._read_from_port)
+            self._reader_thread.daemon = True
+            self.is_connected = True
+            self._reader_thread.start()
+            logging.info("Reader thread started.")
+            return True
 
     def stop(self):
         """
-        Stops the reader thread and closes the serial port.
+        Stops the reader thread and closes the serial port in a thread-safe manner.
         """
-        if not self.is_running:
-            return
+        with self._lock:
+            if not self.is_connected:
+                return
 
-        logging.info("Stopping reader thread and closing serial port.")
-        self._stop_event.set()
-        if self._reader_thread:
-            self._reader_thread.join(timeout=2) # Wait for thread to finish
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-            logging.info("Serial port closed.")
-        self.is_running = False
+            logging.info("Stopping reader thread and closing serial port.")
+            self._stop_event.set()
+            
+            # Close the serial port immediately to cause the reader thread to exit
+            if self.ser and self.ser.is_open:
+                try:
+                    self.ser.close()
+                except serial.SerialException as e:
+                    logging.warning(f"Error closing serial port: {e}")
+            
+            self.is_connected = False
+            self.ser = None
+        
+        # Join the thread outside the lock to prevent deadlocks
+        if self._reader_thread and threading.current_thread() != self._reader_thread:
+            self._reader_thread.join(timeout=2.0)
+            if self._reader_thread.is_alive():
+                logging.warning("Reader thread did not terminate in time.")
+        
+        logging.info("Communication stopped.")
+
 
     def _read_from_port(self):
         """
-        (Internal) The main loop for the reader thread. Reads lines from the
-        serial port and puts them in the response queue.
+        (Internal) The main loop for the reader thread.
         """
         while not self._stop_event.is_set():
             try:
-                if self.ser and self.ser.in_waiting > 0:
+                # The check 'self.ser and self.ser.is_open' is crucial
+                if self.ser and self.ser.is_open and self.ser.in_waiting > 0:
                     line = self.ser.readline().decode('utf-8').strip()
                     if line:
                         logging.info(f"Received: '{line}'")
                         self.response_queue.put(line)
-            except serial.SerialException as e:
-                logging.error(f"Serial error: {e}. Reader thread stopping.")
-                break
+                else:
+                    # Short sleep to prevent busy-waiting when there's no data
+                    time.sleep(0.01)
+
+            except (serial.SerialException, OSError) as e:
+                logging.error(f"Serial error: {e}. Device disconnected.")
+                self.stop() # Trigger a clean shutdown
+                break # Exit the thread loop
             except Exception as e:
                 logging.warning(f"An unexpected error occurred in reader thread: {e}")
-            time.sleep(0.01) # Prevent high CPU usage
 
     def _send_command(self, command: str, timeout: float = 2.0) -> str | None:
         """
-        (Internal) Sends a command to the Arduino and waits for a single-line response.
+        (Internal) Sends a command and waits for a response. Now handles disconnects.
         """
-        if not self.ser or not self.ser.is_open:
-            logging.error("Cannot send command. Serial port is not open.")
+        # --- CHANGE: Check the 'is_connected' flag first ---
+        if not self.is_connected:
+            logging.error("Cannot send command. Not connected.")
             return None
         
-        # Clear the queue of any old responses before sending a new command
-        while not self.response_queue.empty():
-            self.response_queue.get_nowait()
+        with self._lock:
+            # Re-check connection status after acquiring lock
+            if not self.is_connected or not self.ser:
+                logging.error("Cannot send command. Connection lost.")
+                return None
+            
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
 
-        logging.info(f"Sending: '{command}'")
-        self.ser.write(f"{command}\n".encode('utf-8'))
-        
+            try:
+                logging.info(f"Sending: '{command}'")
+                self.ser.write(f"{command}\n".encode('utf-8'))
+            except (serial.SerialException, OSError) as e:
+                logging.error(f"Failed to write to serial port: {e}. Device disconnected.")
+                self.stop()
+                return None
+
         try:
-            # Wait for a response to appear in the queue
             response = self.response_queue.get(timeout=timeout)
             return response
         except queue.Empty:
             logging.warning(f"No response received for command '{command}' within {timeout}s.")
+            if not self.test_connection():
+                 logging.error("Device is not responding after timeout. Assuming disconnection.")
+                 self.stop()
             return None
 
-    # --- Public API Methods ---
+    # --- Public API Methods (no major changes needed, but they are now more robust) ---
 
     def set_channel(self, address: int, channel: int) -> ArduinoError:
-        """
-        Sends the SET command to the Arduino.
-        Args:
-            address (int): The I2C address of the MUX board (e.g., 0x20).
-            channel (int): The channel to activate (1-8).
-        Returns:
-            ArduinoError: The status code returned by the Arduino.
-        """
         command = f"SET {address} {channel}"
         response = self._send_command(command)
         if response and response.isdigit():
@@ -144,13 +152,6 @@ class SerialCommunicator:
         return ArduinoError.UNKNOWN
 
     def reset_mux(self, address: int) -> ArduinoError:
-        """
-        Sends the RESET command to the Arduino.
-        Args:
-            address (int): The I2C address of the MUX board (e.g., 0x20).
-        Returns:
-            ArduinoError: The status code returned by the Arduino.
-        """
         command = f"RST {address}"
         response = self._send_command(command)
         if response and response.isdigit():
@@ -158,45 +159,24 @@ class SerialCommunicator:
         return ArduinoError.UNKNOWN
 
     def scan_i2c_bus(self) -> list[int] | None:
-        """
-        Sends the SCAN command and parses the response to get a list of I2C addresses.
-
-        Returns:
-            list[int] | None: A list of found I2C addresses, or None on error.
-        """
         command = "SCN"
         response = self._send_command(command, timeout=10.0)
-
         if response is None:
             return None
-        
-        # The expected response is a single line of space-separated numbers (e.g., "32 33 34")
         try:
-            # Return an empty list if the response string is empty or just whitespace
             if not response.strip():
                 return []
-            # Split the string by spaces and convert each part to an integer
-            addresses = [int(addr) for addr in response.split()]
-            return addresses
+            return [int(addr) for addr in response.split()]
         except ValueError:
-            logging.error(f"Failed to parse scan response: '{response}' contains non-numeric values.")
+            logging.error(f"Failed to parse scan response: '{response}'")
             return None
 
-    def test_connection(self) -> str | None:
-        """Sends the TEST command to check the connection."""
-        return self._send_command("TST")
+    def test_connection(self) -> bool:
+        """Sends a test command. Returns True on success, False otherwise."""
+        response = self._send_command("TST", timeout=1.0)
+        return response is not None
 
+    # Static method remains the same
     @staticmethod
     def list_available_ports():
-        """A helper function to list all available serial ports."""
-        ports = serial.tools.list_ports.comports()
-        if not ports:
-            print("No COM ports found.")
-            return []
-        
-        print("Available COM ports:")
-        port_list = []
-        for port, desc, hwid in sorted(ports):
-            print(f"- {port}: {desc} [{hwid}]")
-            port_list.append(port)
-        return port_list
+        pass

@@ -1,5 +1,6 @@
 import logging
-import asyncio 
+import asyncio
+import contextlib
 
 from src.opc_ua.serverLogic import OpcUaServer 
 from src.communicator.deviceCommincator import DeviceController
@@ -12,57 +13,46 @@ async def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logging.getLogger("asyncua").setLevel(logging.WARNING)
     
-    # Initialize components to None for robust cleanup in the 'finally' block
     controller = None
     server = None
+    main_task = None
 
     try:
-        # --- 1. CONFIGURATION AND SETUP ---
         logging.info("Loading configurations...")
         hw_config = load_config_file(HARDWARE_CONFIG)
         server_config = load_config_file(SERVER_CONFIG)
         if not hw_config or not server_config:
-            logging.critical("Failed to load configuration. Exiting.")
-            return
+            raise RuntimeError("Failed to load configuration.")
 
         communicator = create_communicator(hw_config)
         if not communicator:
-            logging.critical("Failed to create communicator from config. Exiting.")
-            return
+            raise RuntimeError("Failed to create communicator from config.")
 
         controller = DeviceController(communicator)
         server = OpcUaServer(controller, server_config)
 
-        # --- 2. STARTUP ---
-        logging.info("Starting communication with device...")
+        logging.info("Attempting initial connection to device...")
         if not controller.connect():
-            logging.critical("Failed to start communication with device. Exiting.")
-            return
+            logging.warning("Failed to connect to device on startup. Will attempt to reconnect in the background.")
+        else:
+            logging.info("Device connected successfully.")
 
-        logging.info("Starting OPC UA server and populating nodes...")
-        # The server.start() will now do its initial scan and population
         await server.start()
-        logging.info("Server startup complete. Running indefinitely...")
-
-        # --- 3. RUN INDEFINITELY (THE CRITICAL FIX) ---
-        # This loop keeps the main coroutine alive, preventing the program
-        # from exiting prematurely. The service will now run forever until
-        # it's interrupted by Ctrl+C.
-        while True:
-            await asyncio.sleep(1)
+        
+        # Keep the main task alive to handle shutdown signals
+        main_task = asyncio.Future()
+        await main_task
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         logging.info("Shutdown signal received.")
-
+    except Exception as e:
+        logging.critical(f"An unhandled exception occurred: {e}", exc_info=True)
     finally:
-        # --- 4. GRACEFUL SHUTDOWN ---
-        # This block now runs only after the 'while' loop is broken by an exception.
         logging.info("Starting graceful shutdown...")
+        if main_task and not main_task.done():
+            main_task.set_result(True)
         
-        # Shut down in reverse order of startup
         if server:
-            # It's crucial that your OpcUaServer has a stop() method
-            # to gracefully shut down the asyncua server.
             logging.info("Stopping OPC UA server...")
             await server.stop() 
         
@@ -73,5 +63,5 @@ async def main():
         logging.info("Shutdown complete.")
 
 if __name__ == "__main__":
-    # The try/except here is good, but the main one is inside the async function
-    asyncio.run(main())
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(main())
