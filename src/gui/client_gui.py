@@ -7,8 +7,7 @@ from PySide6.QtCore import Qt, Signal, QObject
 # Assuming clientLogic.py is in the same directory or a reachable path
 from src.opc_ua.clientLogic import OpcUaClientLogic
 
-# --- Logging Setup ---
-# A custom handler to emit logs to the GUI's text box
+# --- Logging Setup (Unchanged) ---
 class GuiLoggingHandler(logging.Handler):
     def __init__(self, slot_emitter):
         super().__init__()
@@ -54,21 +53,29 @@ class OpcUaClientGui(QMainWindow):
         
         self.status_label = QLabel("Status: Disconnected")
         self.status_label.setStyleSheet("color: red; font-weight: bold;")
+        
         conn_box.addWidget(self.url_label)
-        conn_box.addWidget(self.url_input, 1) # The '1' gives the input field priority to stretch
+        conn_box.addWidget(self.url_input, 1)
         conn_box.addWidget(self.connect_button)
         conn_box.addWidget(self.status_label)
+        
+        # --- NEW: Add MUX count display ---
+        conn_box.addStretch() # Add a flexible spacer
+        conn_box.addWidget(QLabel("MUX Board Count:"))
+        self.mux_count_label = QLabel("N/A")
+        self.mux_count_label.setStyleSheet("font-weight: bold;")
+        conn_box.addWidget(self.mux_count_label)
+        
         self.main_layout.addLayout(conn_box)
 
     def _create_device_list_ui(self, parent_layout):
+        # This method is unchanged
         list_box = QVBoxLayout()
         list_box.addWidget(QLabel("Discovered Devices"))
         self.device_list = QListWidget()
-        # The connection now points to the decorated async method
         self.device_list.currentItemChanged.connect(self.on_device_selected)
         
         self.rescan_button = QPushButton("Rescan Hardware")
-        # The connection now points to the decorated async method
         self.rescan_button.clicked.connect(self.rescan_hardware)
 
         list_box.addWidget(self.device_list)
@@ -76,11 +83,11 @@ class OpcUaClientGui(QMainWindow):
         parent_layout.addLayout(list_box, 1)
 
     def _create_device_control_ui(self, parent_layout):
+        # This method is unchanged
         self.control_area = QWidget()
         control_layout = QVBoxLayout(self.control_area)
         control_layout.addWidget(QLabel("Device Control Panel"))
 
-        # ... (No changes to the layout creation itself)
         channel_layout = QHBoxLayout()
         channel_layout.addWidget(QLabel("Active Channel:"))
         self.active_channel_label = QLabel("N/A")
@@ -97,23 +104,22 @@ class OpcUaClientGui(QMainWindow):
         control_layout.addLayout(status_layout)
         control_layout.addWidget(QFrame(self))
         set_channel_layout = QHBoxLayout()
-        set_channel_layout.addWidget(QLabel("Set New Channel (1-8):"))
+        set_channel_layout.addWidget(QLabel("Set New Channel (0-255):"))
         self.channel_spinbox = QSpinBox()
         self.channel_spinbox.setRange(0, 255)
         self.set_channel_button = QPushButton("Set Channel")
-        # The connection now points to the decorated async method
         self.set_channel_button.clicked.connect(self.set_channel)
         set_channel_layout.addWidget(self.channel_spinbox)
         set_channel_layout.addWidget(self.set_channel_button)
         control_layout.addLayout(set_channel_layout)
         self.reset_button = QPushButton("Reset Mux")
-        # The connection now points to the decorated async method
         self.reset_button.clicked.connect(self.reset_mux)
         control_layout.addWidget(self.reset_button, 0, Qt.AlignmentFlag.AlignRight)
         control_layout.addStretch()
         parent_layout.addWidget(self.control_area, 2)
 
     def _create_logging_ui(self):
+        # This method is unchanged
         log_box = QVBoxLayout()
         log_box.addWidget(QLabel("Logs"))
         self.log_output = QTextEdit()
@@ -121,24 +127,15 @@ class OpcUaClientGui(QMainWindow):
         log_box.addWidget(self.log_output)
         self.main_layout.addLayout(log_box)
 
-        # --- MODIFIED LOGGING SETUP ---
-        # 1. Create the emitter and handler as before
         self.log_emitter = Emitter()
         self.log_emitter.log_signal.connect(self.log_output.append)
         gui_handler = GuiLoggingHandler(self.log_emitter)
         
-        # 2. Set a formatter for this specific handler
         gui_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-
-        # 3. Add the handler to the root logger.
-        # DO NOT configure the root logger's level here anymore.
         logging.getLogger().addHandler(gui_handler)
-        
-        # Also set the asyncua logger level to avoid spam
         logging.getLogger("asyncua").setLevel(logging.WARNING)
 
     def set_ui_disconnected_state(self):
-        # ... (No changes in this method)
         self.connect_button.setText("Connect")
         self.url_input.setEnabled(True)
         self.status_label.setText("Status: Disconnected")
@@ -148,19 +145,18 @@ class OpcUaClientGui(QMainWindow):
         self.control_area.setEnabled(False)
         self.active_channel_label.setText("N/A")
         self.last_status_label.setText("N/A")
+        # --- NEW: Reset MUX count label on disconnect ---
+        self.mux_count_label.setText("N/A")
 
     def set_ui_connected_state(self):
-        # ... (No changes in this method)
         self.connect_button.setText("Disconnect")
         self.url_input.setEnabled(False)
         self.status_label.setText("Status: Connected")
         self.status_label.setStyleSheet("color: green; font-weight: bold;")
         self.rescan_button.setEnabled(True)
 
-    # --- ASYNC SLOTS (MODIFIED) ---
     @asyncSlot()
     async def toggle_connection(self):
-        # This check is now simpler and more robust
         if self.client_logic.client:
             await self.disconnect_from_server()
         else:
@@ -171,7 +167,6 @@ class OpcUaClientGui(QMainWindow):
         self.status_label.setStyleSheet("color: orange; font-weight: bold;")
         self.connect_button.setEnabled(False)
         
-        # Pass the URL from the text input to the connect method
         server_url = self.url_input.text()
         is_connected = await self.client_logic.connect(server_url)
         
@@ -179,40 +174,18 @@ class OpcUaClientGui(QMainWindow):
             self.set_ui_connected_state()
             await self.client_logic.find_gateway_and_methods()
             await self.populate_device_list()
+            # --- NEW: Update the count after connecting ---
+            await self.update_mux_count()
         else:
             self.set_ui_disconnected_state()
         
         self.connect_button.setEnabled(True)
-
-
-    # These are helper methods called by other async methods, so they don't need the decorator
-    async def connect_to_server(self):
-        self.status_label.setText("Status: Connecting...")
-        self.status_label.setStyleSheet("color: orange; font-weight: bold;")
-        self.connect_button.setEnabled(False)
-        
-        # Get the URL from the GUI's text input
-        server_url = self.url_input.text()
-        is_connected = await self.client_logic.connect(server_url)
-        
-        if is_connected:
-            self.set_ui_connected_state()
-            # These calls are correct and should remain
-            await self.client_logic.find_gateway_and_methods()
-            await self.populate_device_list()
-        else:
-            self.set_ui_disconnected_state()
-        
-        self.connect_button.setEnabled(True)
-
 
     async def disconnect_from_server(self):
-        # This now calls the new, more thorough disconnect logic
         await self.client_logic.disconnect()
         self.set_ui_disconnected_state()
 
     async def populate_device_list(self):
-        # ... (No changes in this method)
         self.device_list.clear()
         self.control_area.setEnabled(False)
         logging.info("Discovering devices...")
@@ -222,6 +195,18 @@ class OpcUaClientGui(QMainWindow):
             logging.info(f"Found devices: {device_addrs}")
         else:
             logging.warning("No devices found.")
+
+    # --- NEW: Helper method to update the count display ---
+    async def update_mux_count(self):
+        """Reads the MUX count from the logic layer and updates the GUI."""
+        logging.info("Reading MUX board count...")
+        count = await self.client_logic.read_mux_count()
+        if count is not None:
+            self.mux_count_label.setText(str(count))
+            logging.info(f"Server reports {count} MUX boards.")
+        else:
+            self.mux_count_label.setText("Error")
+            logging.error("Failed to read MUX board count.")
 
     @asyncSlot()
     async def on_device_selected(self, current_item, previous_item):
@@ -235,7 +220,6 @@ class OpcUaClientGui(QMainWindow):
         await self.update_device_details()
 
     async def update_device_details(self):
-        # ... (No changes in this method)
         if not self.current_device_addr: return
         state = await self.client_logic.read_device_state(self.current_device_addr)
         if state:
@@ -250,18 +234,28 @@ class OpcUaClientGui(QMainWindow):
     async def set_channel(self):
         if not self.current_device_addr: return
         channel_to_set = self.channel_spinbox.value()
-        logging.info(f"Calling SetChannel({channel_to_set}) on {self.current_device_addr}")
-        await self.client_logic.write_channel(self.current_device_addr, channel_to_set)
-        await asyncio.sleep(0.1)
+        logging.info(f"Writing {channel_to_set} to SetChannel on {self.current_device_addr}")
+        success = await self.client_logic.write_channel(self.current_device_addr, channel_to_set)
+        if not success:
+            logging.error(f"Failed to write channel for {self.current_device_addr}.")
+        await asyncio.sleep(0.5) # A slightly longer sleep to ensure server has time to update
         await self.update_device_details()
 
     @asyncSlot()
     async def reset_mux(self):
+        # --- REWORKED: This method is now updated ---
         if not self.current_device_addr: return
-        logging.info(f"Calling Reset() on {self.current_device_addr}")
-        result = await self.client_logic.call_reset_mux(self.current_device_addr)
-        logging.info(f"Reset method returned: {result}")
-        await asyncio.sleep(0.1)
+        logging.info(f"Triggering Reset on {self.current_device_addr}")
+        # 1. Call the new logic method
+        success = await self.client_logic.trigger_reset_mux(self.current_device_addr)
+        
+        # 2. Check the boolean result
+        if success:
+            logging.info(f"Reset command sent successfully to {self.current_device_addr}.")
+        else:
+            logging.error(f"Failed to send Reset command to {self.current_device_addr}.")
+            
+        await asyncio.sleep(0.5) # A slightly longer sleep to ensure server has time to update
         await self.update_device_details()
 
     @asyncSlot()
@@ -270,3 +264,4 @@ class OpcUaClientGui(QMainWindow):
         await self.client_logic.call_rescan_hardware()
         logging.info("Rescan complete. Refreshing device list.")
         await self.populate_device_list()
+        await self.update_mux_count()

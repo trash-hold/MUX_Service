@@ -1,12 +1,31 @@
 import asyncio
 import logging
+import contextlib
 from asyncua import Server, ua
-
-# It's good practice to keep uamethod for other potential methods,
-# but it's not strictly needed if you remove all methods.
 from asyncua.common.methods import uamethod
 
+# Assuming DeviceController is in this path, adjust if necessary
 from src.communicator.deviceCommincator import DeviceController, MuxDevice
+
+class SubHandler:
+    def __init__(self, server_logic):
+        self.server_logic = server_logic
+
+    async def datachange_notification(self, node, val, data):
+        if not self.server_logic.is_running:
+            return
+
+        try:
+            parent_node = await self.server_logic.server.get_node(node).get_parent()
+            node_name = (await node.read_browse_name()).Name
+
+            if node_name == "SetChannel":
+                await self.server_logic._handle_set_channel_event(parent_node, node, val)
+            elif node_name == "Reset":
+                await self.server_logic._handle_reset_event(parent_node, node, val)
+
+        except Exception as e:
+            logging.error(f"Error in datachange_notification for node {node}: {e}", exc_info=True)
 
 class OpcUaServer:
     def __init__(self, controller: DeviceController, config: dict):
@@ -16,8 +35,12 @@ class OpcUaServer:
         self.idx = 0
         self.mux_nodes = {}
         self.gateway_node = None
-        # Add a variable to hold the MUX count
         self.mux_count_var = None
+        self.gateway_status_var = None
+        
+        self.nodes_to_monitor = []
+        self.is_running = False
+        self._reconnect_task = None
 
     async def _initialize_server(self):
         await self.server.init()
@@ -36,36 +59,31 @@ class OpcUaServer:
         mux_obj = await self.gateway_node.add_object(self.idx, f"Mux_{addr_str}")
         device_state = self.controller.devices.get(address, MuxDevice(address))
 
-        # This variable remains read-only for clients.
-        active_ch_var = await mux_obj.add_variable(self.idx, "ActiveChannel", device_state.active_channel, ua.VariantType.Byte)
+        active_ch_var = await mux_obj.add_variable(self.idx, "ActiveChannel", device_state.active_channel, ua.VariantType.Int32)
         await active_ch_var.set_writable(False)
-
         status_op_var = await mux_obj.add_variable(self.idx, "LastOperationStatus", device_state.last_status)
-        await status_op_var.set_writable(False) # Status should be read-only for the client
+        await status_op_var.set_writable(False)
 
-        # --- REWORK: Replace SetChannel method with a writable variable ---
-        # This variable is what the client will write to.
-        set_ch_var = await mux_obj.add_variable(self.idx, "SetChannel", 0, ua.VariantType.Byte)
+        set_ch_var = await mux_obj.add_variable(self.idx, "SetChannel", 0, ua.VariantType.Int32)
         await set_ch_var.set_writable(True)
-        # Add a callback for when the client writes to this variable
-        self.server.subscribe_data_change(set_ch_var, self._set_channel_handler)
-
-        # --- REWORK: Replace Reset method with a writable variable ---
-        # Client writes a '1' to this variable to trigger a reset.
-        reset_var = await mux_obj.add_variable(self.idx, "Reset", 0, ua.VariantType.Boolean)
+        reset_var = await mux_obj.add_variable(self.idx, "Reset", False, ua.VariantType.Boolean)
         await reset_var.set_writable(True)
-        # Add a callback for the reset trigger
-        self.server.subscribe_data_change(reset_var, self._reset_handler)
 
+        self.nodes_to_monitor.append(set_ch_var)
+        self.nodes_to_monitor.append(reset_var)
         self.mux_nodes[address] = mux_obj
-        # Update the MUX count after adding a node
         await self._update_mux_count()
 
     async def _initial_scan_and_populate(self):
-        logging.info("Performing initial hardware scan via controller...")
+        logging.info("Performing initial hardware scan...")
+        if not self.controller.is_connected:
+            logging.warning("Cannot scan, device is not connected.")
+            await self._update_gateway_status("Disconnected")
+            return
+
         found_devices = self.controller.scan_for_devices()
         if not found_devices:
-            # Still update the count even if no devices are found
+            logging.warning("Initial scan found no devices.")
             await self._update_mux_count()
             return
 
@@ -73,123 +91,162 @@ class OpcUaServer:
             await self._create_mux_node(addr)
             logging.info(f"Sending initial RESET command to MUX at {hex(addr)}")
             self.controller.reset_mux(addr)
-            # Update the node values after reset
             await self._update_mux_variables(addr)
 
     async def start(self):
         await self._initialize_server()
         self.gateway_node = await self.server.nodes.objects.add_object(self.idx, "ArduinoGateway")
-        await self.gateway_node.add_variable(self.idx, "GatewayStatus", "Connected", ua.VariantType.String)
-
-        # --- NEW: Add the MUX count variable ---
+        self.gateway_status_var = await self.gateway_node.add_variable(self.idx, "GatewayStatus", "Initializing", ua.VariantType.String)
+        await self.gateway_status_var.set_writable(False)
+        
         self.mux_count_var = await self.gateway_node.add_variable(self.idx, "MuxBoardCount", 0, ua.VariantType.UInt32)
         await self.mux_count_var.set_writable(False)
-
-        # Keep the rescan method as it's useful for system management
         await self.gateway_node.add_method(self.idx, "RescanHardware", self._rescan_handler)
 
         await self.server.start()
         logging.info(f"OPC UA server is live at {self.config['endpoint']}")
+        
+        await self._update_gateway_status("Connected" if self.controller.is_connected else "Disconnected")
         await self._initial_scan_and_populate()
-        logging.info("Initial device population complete.")
+        
+        handler = SubHandler(self)
+        sub = await self.server.create_subscription(500, handler)
+        
+        if self.nodes_to_monitor:
+            await sub.subscribe_data_change(self.nodes_to_monitor)
+            logging.info(f"Server subscribed to data changes for {len(self.nodes_to_monitor)} trigger nodes.")
+
+        self.is_running = True
+        self._reconnect_task = asyncio.create_task(self._connection_monitor())
+        logging.info("Server startup complete. Running indefinitely...")
 
     async def stop(self):
-        # Check if the server object exists AND its internal binary server has been initialized.
-        # self.server.bserver is only created after a successful server.init() call inside start().
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reconnect_task
+        
         if self.server and self.server.bserver:
             await self.server.stop()
             logging.info("OPC UA server stopped.")
-        else:
-            logging.info("OPC UA server was not running, no need to stop.")
 
-    # --- REWORK: Data change handler for SetChannel variable ---
-    async def _set_channel_handler(self, node, val, data):
-        """Handles data change events for the SetChannel variable."""
+    async def _connection_monitor(self):
+        """Periodically checks connection and attempts to reconnect if needed."""
+        while True:
+            await asyncio.sleep(10) # Check every 10 seconds
+            if not self.controller.is_connected:
+                logging.warning("Device disconnected. Attempting to reconnect...")
+                await self._update_gateway_status("Reconnecting")
+                if self.controller.connect():
+                    logging.info("Successfully reconnected to device.")
+                    await self._update_gateway_status("Connected")
+                    # Optionally trigger a rescan after reconnecting
+                    await self._rescan_handler(self.gateway_node.nodeid) 
+                else:
+                    await self._update_gateway_status("Disconnected")
+
+
+    async def _handle_set_channel_event(self, parent_node, trigger_node, val):
+        """Handles the logic for a SetChannel write event."""
+        parent_name = (await parent_node.read_browse_name()).Name
+        
+        # A value of 0 can be considered a "no-op" or reset, so we ignore it.
+        if val == 0:
+            return
+            
         try:
-            # Get the parent MUX object from the node that changed
-            parent_node = await self.server.get_node(node).get_parent()
-            parent_name = (await parent_node.read_browse_name()).Name
             address = int(parent_name.split('_')[1], 16)
+            current_state = self.controller.devices.get(address)
 
-            logging.info(f"Write detected on {parent_name}: SetChannel to {val}")
+            if not current_state:
+                logging.warning(f"Received set channel for unknown device {parent_name}. Ignoring.")
+                return
 
-            # 1. Command the hardware
-            self.controller.set_channel(address, val)
+            # This check is still useful to prevent spamming the same command repeatedly
+            # without an intervening reset.
+            if val == current_state.active_channel:
+                logging.debug(f"Ignoring redundant SetChannel for {parent_name} to value {val}.")
+                await trigger_node.write_value(ua.Variant(0, ua.VariantType.Int32))
+                return
 
-            # 2. Update the OPC UA variables to reflect the new state
-            await self._update_mux_variables(address)
+            logging.info(f"Write event on {parent_name}: SetChannel to {val}")
+            if self.controller.set_channel(address, val):
+                await self._update_mux_variables(address)
+            else:
+                logging.error(f"Failed to set channel for {parent_name}. Device disconnected.")
+                await self._update_mux_variables(address)
 
         except Exception as e:
-            logging.error(f"Error in SetChannel handler for {parent_name}: {e}")
+            logging.error(f"Error processing SetChannel for {parent_name}: {e}")
+        finally:
+            # This ensures the next write of the same value will trigger an event.
+            logging.debug(f"Resetting SetChannel trigger for {parent_name} back to 0.")
+            await trigger_node.write_value(ua.Variant(0, ua.VariantType.Int32))
 
-    # --- REWORK: Data change handler for Reset variable ---
-    async def _reset_handler(self, node, val, data):
-        """Handles data change events for the Reset variable."""
-        # Only trigger on a 'True' or '1' value to prevent accidental resets
+
+    async def _handle_reset_event(self, parent_node, trigger_node, val):
         if not val:
             return
+        parent_name = (await parent_node.read_browse_name()).Name
         try:
-            parent_node = await self.server.get_node(node).get_parent()
-            parent_name = (await parent_node.read_browse_name()).Name
             address = int(parent_name.split('_')[1], 16)
-
-            logging.info(f"Write detected on {parent_name}: Reset triggered.")
-
-            # 1. Command the hardware
-            self.controller.reset_mux(address)
-
-            # 2. Update the OPC UA variables
-            await self._update_mux_variables(address)
-
-            # 3. Reset the trigger variable back to False
-            await self.server.get_node(node).write_value(False)
-
+            logging.info(f"Write event on {parent_name}: Reset triggered.")
+            if self.controller.reset_mux(address):
+                await self._update_mux_variables(address)
+            else:
+                logging.error(f"Failed to reset {parent_name}. Device disconnected.")
+                await self._update_mux_variables(address) # Update with error status
+        
         except Exception as e:
-            logging.error(f"Error in Reset handler for {parent_name}: {e}")
+            logging.error(f"Error processing Reset for {parent_name}: {e}")
+        finally:
+            await trigger_node.write_value(False)
 
-    # --- HELPER: A single function to update MUX variables ---
     async def _update_mux_variables(self, address: int):
-        """Updates the OPC UA variables for a given MUX from the controller state."""
-        if address in self.mux_nodes:
+        if address in self.mux_nodes and address in self.controller.devices:
             device_state = self.controller.devices[address]
             mux_node = self.mux_nodes[address]
-
-            # Update ActiveChannel
+            
             channel_node = await mux_node.get_child(f"{self.idx}:ActiveChannel")
-            await channel_node.write_value(ua.Variant(device_state.active_channel, ua.VariantType.Byte))
-
-            # Update LastOperationStatus
+            await channel_node.write_value(ua.Variant(device_state.active_channel, ua.VariantType.Int32))
+            
             status_node = await mux_node.get_child(f"{self.idx}:LastOperationStatus")
             await status_node.write_value(device_state.last_status)
 
-    # --- HELPER: Update the MUX count ---
     async def _update_mux_count(self):
-        """Updates the MuxBoardCount variable."""
+        """Updates the MuxBoardCount variable on the server."""
         if self.mux_count_var:
             count = len(self.mux_nodes)
-            await self.mux_count_var.write_value(count)
+            await self.mux_count_var.write_value(ua.Variant(count, ua.VariantType.UInt32))
+
+    async def _update_gateway_status(self, status: str):
+        if self.gateway_status_var:
+            await self.gateway_status_var.write_value(status)
+            logging.info(f"Gateway status updated to: {status}")
 
     @uamethod
     async def _rescan_handler(self, parent):
-        logging.info("Method call: Relaying rescan request to DeviceController...")
-        existing_addrs_set = set(self.mux_nodes.keys())
-        found_addrs_set = set(self.controller.scan_for_devices())
-
-        addrs_to_add = found_addrs_set - existing_addrs_set
-        addrs_to_remove = existing_addrs_set - found_addrs_set
-
-        for addr in addrs_to_add:
-            await self._create_mux_node(addr)
-
-        for addr in addrs_to_remove:
-            if addr in self.mux_nodes:
-                node_to_delete = self.mux_nodes.pop(addr)
-                await self.server.delete_nodes([node_to_delete], recursive=True)
-                logging.info(f"Removed node for disconnected MUX at address {hex(addr)}")
-        
-        # Update the count after adding/removing nodes
-        await self._update_mux_count()
-
+        logging.warning("Rescan requested. A server restart is still the safest method for hardware changes.")
         event_generator = await self.server.get_event_generator()
-        await event_generator.trigger(message="Address space updated after hardware rescan.")
-        logging.info("Rescan complete.")
+        await event_generator.trigger(message="Rescan requested. Note: Dynamic node removal is not supported; restart is recommended for hardware removal.")
+        
+        # Perform a non-blocking scan to add new devices
+        logging.info("Scanning for new devices...")
+        found_devices = self.controller.scan_for_devices()
+        if not found_devices:
+            logging.info("Rescan found no new devices.")
+            return
+        
+        new_devices_added = 0
+        for addr in found_devices:
+            if addr not in self.mux_nodes:
+                logging.info(f"Rescan found new device at {hex(addr)}. Adding node.")
+                await self._create_mux_node(addr)
+                self.controller.reset_mux(addr)
+                await self._update_mux_variables(addr)
+                new_devices_added += 1
+        
+        if new_devices_added > 0:
+            logging.info(f"Added {new_devices_added} new device(s). Subscriptions must be re-initialized by restarting the server to make them active.")
+        
+        logging.info("Rescan handler complete.")
